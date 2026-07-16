@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+data/raw/
+data/processed/
+chroma_db/
+.env
+*.jsonl.bak
+.ipynb_checkpoints/
