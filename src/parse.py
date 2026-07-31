@@ -1,6 +1,7 @@
 """
 Parse raw SEC 10-K filings (full-submission.txt) into clean,
-section-labeled text chunks.
+section-labeled text chunks. Falls back to generic chunking for
+filers whose in-body headings don't contain matchable "Item N." text.
 """
 
 import re
@@ -10,14 +11,13 @@ from bs4 import BeautifulSoup
 RAW_DIR = Path("data/raw/sec-edgar-filings")
 OUT_DIR = Path("data/processed")
 
-# Case-insensitive, handles "Item"/"ITEM", regular or non-breaking spaces,
-# and titles that appear on the same line OR the next line.
 ITEM_PATTERN = re.compile(
     r'Item\s+(\d{1,2}[A-C]?)\.\s*\n?\s*([A-Z][A-Za-z,\u2019\'\-\s]{2,80})',
     re.IGNORECASE
 )
 
 CROSS_REF_TRIGGERS = ("refer to", "see ", "pursuant to", "under item", "described in")
+MIN_EXPECTED_SECTIONS = 12  # a real 10-K has ~15 Items; below this, something's wrong
 
 def extract_html_from_submission(filepath):
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
@@ -29,8 +29,10 @@ def html_to_clean_text(html):
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style"]):
         tag.decompose()
+    for hidden in soup.select('[style*="display:none"], [style*="display: none"]'):
+        hidden.decompose()
     text = soup.get_text(separator="\n")
-    text = text.replace("\xa0", " ")  # normalize non-breaking spaces
+    text = text.replace("\xa0", " ")
     text = re.sub(r"\n\s*\n+", "\n\n", text)
     return text.strip()
 
@@ -50,7 +52,6 @@ def split_by_item(text):
         m for m in raw_matches
         if not is_toc_entry(text, m) and not is_cross_reference(text, m)
     ]
-
     seen = set()
     filtered = []
     for m in real_matches:
@@ -67,6 +68,18 @@ def split_by_item(text):
         sections[header] = text[start:end].strip()
     return sections
 
+def fallback_chunk(text, chunk_size=2000, overlap=200):
+    """Generic chunking for filers whose headers aren't matchable as text."""
+    chunks = {}
+    start = 0
+    idx = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks[f"Chunk {idx}"] = text[start:end].strip()
+        start += chunk_size - overlap
+        idx += 1
+    return chunks
+
 def process_filing(filepath, company, fiscal_year):
     html = extract_html_from_submission(filepath)
     if not html:
@@ -74,11 +87,19 @@ def process_filing(filepath, company, fiscal_year):
         return None
     text = html_to_clean_text(html)
     sections = split_by_item(text)
+
+    used_fallback = False
+    if len(sections) < MIN_EXPECTED_SECTIONS:
+        print(f"  Only {len(sections)} sections found — falling back to generic chunking")
+        sections = fallback_chunk(text)
+        used_fallback = True
+
     return {
         "company": company,
         "fiscal_year": fiscal_year,
         "sections": sections,
         "num_sections_found": len(sections),
+        "used_fallback": used_fallback,
     }
 
 def process_all():
@@ -98,10 +119,13 @@ def process_all():
             print(f"Processing {company} — {filing_dir.name}")
             result = process_filing(filepath, company, filing_dir.name)
             if result:
-                print(f"  Found {result['num_sections_found']} Item sections")
+                tag = "(fallback)" if result["used_fallback"] else ""
+                print(f"  Found {result['num_sections_found']} sections {tag}")
                 results.append(result)
     return results
 
 if __name__ == "__main__":
     results = process_all()
     print(f"\nProcessed {len(results)} filings total.")
+    fallback_count = sum(1 for r in results if r["used_fallback"])
+    print(f"Filings using fallback chunking: {fallback_count}")
